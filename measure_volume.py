@@ -7,7 +7,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import pickle
-from typing import Tuple
 from scipy import stats
 import os
 
@@ -1000,7 +999,7 @@ def main():
             pac_bound = results["pac_bound"]
             print(f"Model parameters: {pac_bound['n_params']:,}")
             print(f"Training samples: {pac_bound['n_train_samples']:,}")
-            print(f"Bits per parameter: 32 (float32)")
+            print("Bits per parameter: 32 (float32)")
             print(f"log|H| (bits): {pac_bound['log_H_bits']:,}")
             print(
                 f"Confidence level: {pac_bound['confidence']:.0%} (δ = {pac_bound['delta']})"
