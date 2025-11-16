@@ -1,112 +1,117 @@
+"""Single MNIST pair experiment for estimating low-loss volume."""
+
+from __future__ import annotations
+
+import argparse
+import math
+import pickle
+from pathlib import Path
+from typing import Tuple
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
+import matplotlib.pyplot as plt
+import numpy as np
 import optax
 import tensorflow_datasets as tfds
-import numpy as np
-import matplotlib.pyplot as plt
 from tqdm import tqdm
-import pickle
-from scipy import stats
-import os
 
 
-class SimpleCNN(eqx.Module):
-    """Tiny convolutional network for MNIST binary classification (~922 parameters)."""
+# Configuration ----------------------------------------------------------------
 
-    conv1: eqx.nn.Conv2d
-    pool: eqx.nn.MaxPool2d
+DIGIT_A = 5
+DIGIT_B = 8
+TRAIN_PER_CLASS = 1000
+HOLDOUT_PER_CLASS = 1000
+N_RANDOM_SAMPLES = 10_000_000
+N_SGD_STEPS = 5_000
+BATCH_SIZE = 32
+LEARNING_RATE = 3e-3
+SEED = 7
+PLOT_DIR = Path("plots")
+RESULTS_CACHE_PATH = Path("results.pkl")
+HISTOGRAM_PATH = PLOT_DIR / "histogram.png"
+TRAINING_PLOT_PATH = PLOT_DIR / "training_curves.png"
+RANDOM_RANKED_PATH = PLOT_DIR / "random_ranked.png"
+TOP_HOLDOUT_PLOT_PATH = PLOT_DIR / "top_random_holdout.png"
+HOLDOUT_MEAN_ERROR_PLOT_PATH = PLOT_DIR / "holdout_mean_error_rate.png"
+PERCENTILE_HOLDOUT_ERROR_PLOT_PATH = PLOT_DIR / "holdout_error_percentile.png"
+
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Cache helpers ---------------------------------------------------------------
+
+
+def load_results_cache(path: Path = RESULTS_CACHE_PATH) -> Tuple[dict, bool]:
+    """Load cached results and guard against corrupt/non-dict payloads."""
+    if not path.exists():
+        return {}, False
+    try:
+        with path.open("rb") as f:
+            data = pickle.load(f)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"Could not read cache at {path}: {exc}")
+        return {}, True
+    if not isinstance(data, dict):
+        print(f"Ignoring cache {path} because payload is {type(data)}")
+        return {}, True
+    return data, False
+
+
+def save_results_cache(
+    payload: dict, path: Path = RESULTS_CACHE_PATH, *, allow_overwrite: bool = True
+) -> None:
+    """Persist cached results if they are well-formed."""
+    if not allow_overwrite:
+        print(f"Skipping cache write to {path} (overwrite not allowed).")
+        return
+    if not isinstance(payload, dict):
+        print("Refusing to write cache: payload is not a dict")
+        return
+    try:
+        with path.open("wb") as f:
+            pickle.dump(payload, f)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"Could not write cache to {path}: {exc}")
+
+
+# Model ------------------------------------------------------------------------
+
+
+class TinyMLP(eqx.Module):
+    """Two-layer perceptron used for MNIST binary classification."""
+
     linear1: eqx.nn.Linear
     linear2: eqx.nn.Linear
 
-    def __init__(self, key):
-        key1, key2, key3 = jax.random.split(key, 3)
-        self.conv1 = eqx.nn.Conv2d(1, 4, kernel_size=3, key=key1)
-        self.pool = eqx.nn.MaxPool2d(kernel_size=4, stride=4)  # More aggressive pooling
-        self.linear1 = eqx.nn.Linear(
-            4 * 6 * 6, 6, key=key2
-        )  # Much smaller hidden layer
-        self.linear2 = eqx.nn.Linear(6, 2, use_bias=False, key=key3)
+    def __init__(self, key: jax.Array):
+        key1, key2 = jax.random.split(key)
+        self.linear1 = eqx.nn.Linear(28 * 28, 32, key=key1)
+        self.linear2 = eqx.nn.Linear(32, 2, key=key2)
 
-    def __call__(self, x):
-        # x shape: (28, 28) -> add channel dim
-        x = x[None, :, :]  # (1, 28, 28)
-
-        # Conv block
-        x = self.conv1(x)  # (4, 26, 26)
-        x = jax.nn.relu(x)
-        x = self.pool(x)  # (4, 6, 6) - 4x4 pooling reduces 26x26 to 6x6
-
-        # Flatten and dense layers
-        x = x.reshape(-1)  # (144,)
-        x = self.linear1(x)  # (6,)
-        x = jax.nn.relu(x)
-        x = self.linear2(x)  # (2,)
-
-        return x
-
-
-def load_mnist_binary(test_split_ratio=0.2):
-    """Load MNIST and filter for 0s and 1s only. Split into train, eval (for random sampling), and holdout."""
-    ds = tfds.load("mnist", split="train", as_supervised=True)
-
-    # Convert to numpy arrays
-    images, labels = [], []
-    for image, label in tfds.as_numpy(ds):
-        if label in [0, 1]:
-            images.append(image.astype(np.float32) / 255.0)
-            labels.append(label)
-
-    images = np.array(images).squeeze()  # Remove channel dim
-    labels = np.array(labels)
-
-    # Shuffle
-    indices = np.random.permutation(len(images))
-    images = images[indices]
-    labels = labels[indices]
-
-    # Split: train (60%), eval (20% - for random sampling), holdout (20% - final comparison)
-    n_total = len(images)
-    n_holdout = int(n_total * 0.2)
-    n_eval = int(n_total * 0.2)
-    n_train = n_total - n_holdout - n_eval
-
-    train_images = images[:n_train]
-    train_labels = labels[:n_train]
-    eval_images = images[n_train : n_train + n_eval]
-    eval_labels = labels[n_train : n_train + n_eval]
-    holdout_images = images[n_train + n_eval :]
-    holdout_labels = labels[n_train + n_eval :]
-
-    print(f"Train set: {len(train_images)} samples")
-    print(f"Eval set (for random sampling): {len(eval_images)} samples")
-    print(f"Holdout set (final comparison): {len(holdout_images)} samples")
-    print(
-        f"Class distribution - 0s: {np.sum(train_labels == 0)}, 1s: {np.sum(train_labels == 1)}"
-    )
-
-    return (
-        (train_images, train_labels),
-        (eval_images, eval_labels),
-        (holdout_images, holdout_labels),
-    )
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = x.reshape(-1)
+        x = jax.nn.relu(self.linear1(x))
+        return self.linear2(x)
 
 
 @eqx.filter_jit
-def compute_accuracy(model, images, labels):
-    """Compute accuracy on a batch of images."""
+def compute_accuracy(model: TinyMLP, images: jax.Array, labels: jax.Array) -> jax.Array:
+    """Return accuracy for a batch of images."""
 
-    def predict_single(image):
+    def predict_single(image, label):
         logits = model(image)
-        return jnp.argmax(logits)
+        return jnp.argmax(logits), label
 
-    predictions = eqx.filter_vmap(predict_single)(images)
-    return jnp.mean(predictions == labels)
+    preds, labels = eqx.filter_vmap(predict_single)(images, labels)
+    return jnp.mean(preds == labels)
 
 
 @eqx.filter_jit
-def loss_fn(model, images, labels):
-    """Cross-entropy loss."""
+def loss_fn(model: TinyMLP, images: jax.Array, labels: jax.Array) -> jax.Array:
+    """Cross-entropy loss between model predictions and integer labels."""
 
     def loss_single(image, label):
         logits = model(image)
@@ -117,1165 +122,775 @@ def loss_fn(model, images, labels):
 
 
 @eqx.filter_jit
-def train_step(model, opt_state, optimizer, images, labels):
-    """Single training step."""
+def train_step(
+    model: TinyMLP,
+    opt_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+    images: jax.Array,
+    labels: jax.Array,
+) -> Tuple[TinyMLP, optax.OptState, jax.Array]:
+    """One SGD step with Adam optimizer."""
     loss, grads = eqx.filter_value_and_grad(loss_fn)(model, images, labels)
     updates, opt_state = optimizer.update(grads, opt_state)
     model = eqx.apply_updates(model, updates)
     return model, opt_state, loss
 
 
-def sample_random_accuracies(
-    n_samples, test_data, key, data_batch_size=None, model_batch_size=150
+# Data loading -----------------------------------------------------------------
+
+
+def apply_random_label_noise(
+    split, fraction: float, base_seed: int, *, seed_offset: int
 ):
-    """Sample random network initializations and compute their accuracies and losses."""
-    test_images, test_labels = test_data
-    test_images_jax = jnp.array(test_images)
-    test_labels_jax = jnp.array(test_labels)
+    """Randomly reassign labels for a fraction of the split."""
+    if fraction <= 0:
+        return split
+    images, labels = split
+    labels = np.array(labels, copy=True)
+    n = len(labels)
+    fraction = min(1.0, max(0.0, fraction))
+    count = int(math.ceil(fraction * n))
+    if count == 0:
+        return split
+    rng = np.random.default_rng(base_seed + seed_offset)
+    indices = rng.choice(n, size=count, replace=False)
+    labels[indices] = rng.integers(0, 2, size=count, dtype=labels.dtype)
+    return images, labels
 
-    # Use smaller subset for speed during random sampling
-    if data_batch_size is None:
-        data_batch_size = 1_000_000_000
-    subset_size = min(data_batch_size, len(test_images))
-    test_images_subset = test_images_jax[:subset_size]
-    test_labels_subset = test_labels_jax[:subset_size]
 
-    @eqx.filter_jit
-    def evaluate_batch(keys):
-        """Evaluate a batch of models in parallel using vmap."""
+def load_mnist_pair(
+    digit_a: int,
+    digit_b: int,
+    train_per_class: int,
+    holdout_per_class: int,
+    seed: int,
+    random_label_frac: float = 0.0,
+):
+    """Return balanced train/holdout splits for two MNIST digits."""
 
-        def init_and_evaluate(single_key):
-            model = SimpleCNN(single_key)
-            acc = compute_accuracy(model, test_images_subset, test_labels_subset)
-            loss = loss_fn(model, test_images_subset, test_labels_subset)
-            return acc, loss
+    def _collect(dataset, per_class_limit, seed_offset):
+        buckets = {digit_a: [], digit_b: []}
+        for image, label in tfds.as_numpy(dataset):
+            label = int(label)
+            if label not in buckets:
+                continue
+            if len(buckets[label]) >= per_class_limit:
+                continue
+            buckets[label].append(np.squeeze(image).astype(np.float32) / 255.0)
+            if all(len(v) >= per_class_limit for v in buckets.values()):
+                break
 
-        return eqx.filter_vmap(init_and_evaluate)(keys)
+        rng = np.random.default_rng(seed + seed_offset)
+        for digit in buckets:
+            arr = np.stack(buckets[digit])
+            perm = rng.permutation(len(arr))
+            buckets[digit] = arr[perm]
+        return buckets
 
-    accuracies = []
-    losses = []
-    n_batches = (n_samples + model_batch_size - 1) // model_batch_size
+    def _build_split(buckets, per_class, seed_offset):
+        rng = np.random.default_rng(seed + seed_offset)
+        images = []
+        labels = []
+        for digit in (digit_a, digit_b):
+            arr = buckets[digit][:per_class]
+            label = 0 if digit == digit_a else 1
+            images.append(arr)
+            labels.append(np.full(len(arr), label, dtype=np.int32))
+        images = np.concatenate(images)
+        labels = np.concatenate(labels)
+        perm = rng.permutation(len(images))
+        return images[perm], labels[perm]
 
-    print(
-        f"\nSampling {n_samples} random initializations in batches of {model_batch_size}..."
+    train_ds = tfds.load("mnist", split="train", as_supervised=True)
+    test_ds = tfds.load("mnist", split="test", as_supervised=True)
+
+    train_buckets = _collect(train_ds, train_per_class, seed_offset=0)
+    train_split = _build_split(train_buckets, train_per_class, seed_offset=1)
+
+    holdout_buckets = _collect(test_ds, holdout_per_class, seed_offset=2)
+    holdout_split = _build_split(holdout_buckets, holdout_per_class, seed_offset=3)
+    train_split = apply_random_label_noise(
+        train_split, random_label_frac, seed, seed_offset=4
     )
-    for batch_idx in tqdm(range(n_batches)):
-        # Generate batch of keys
-        batch_size = min(model_batch_size, n_samples - batch_idx * model_batch_size)
-        keys = jax.random.split(key, batch_size + 1)
-        key = keys[0]
-        batch_keys = keys[1:]
-
-        # Evaluate batch
-        batch_accs, batch_losses = evaluate_batch(batch_keys)
-        accuracies.extend([float(acc) for acc in batch_accs])
-        losses.extend([float(loss) for loss in batch_losses])
-
-    accuracies = np.array(accuracies)
-    losses = np.array(losses)
-
-    # Return accuracies, losses, and the test set size used
-    return accuracies, losses, subset_size
+    holdout_split = apply_random_label_noise(
+        holdout_split, random_label_frac, seed, seed_offset=5
+    )
+    return train_split, holdout_split
 
 
-def count_parameters(model):
-    """Count the total number of trainable parameters in the model by traversing the pytree."""
-    # Get all leaves of the pytree
-    leaves = jax.tree_util.tree_leaves(model)
-
-    # Count parameters in array leaves
-    total = 0
-    for leaf in leaves:
-        if isinstance(leaf, jnp.ndarray):
-            total += leaf.size
-
-    return total
+# Experiment helpers -----------------------------------------------------------
 
 
-def compute_pac_bound(
-    n_params, n_train_samples, train_error, delta=0.5, bits_per_param=32
-):
-    """
-    Compute PAC generalization bound using parameter counting.
+def count_parameters(model: TinyMLP) -> int:
+    leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+    return sum(leaf.size for leaf in leaves)
 
-    PAC bound: With probability at least (1 - delta), the generalization error is at most:
-        gen_error ≤ train_error + sqrt((log|H| + log(1/delta)) / (2m))
 
-    Where:
-        - |H| is the size of hypothesis class
-        - For neural networks: log|H| ≈ n_params × bits_per_param (assuming each param is quantized)
-        - m is the number of training samples
-        - delta is the confidence parameter (0.5 for 50% confidence)
+@eqx.filter_jit
+def _batch_model_accuracies(
+    model_keys: jax.Array,
+    images: jax.Array,
+    labels: jax.Array,
+) -> jax.Array:
+    """Return accuracies for each initialization key in `model_keys`."""
 
-    Args:
-        n_params: Number of model parameters
-        n_train_samples: Number of training samples
-        train_error: Training error rate (0-1)
-        delta: Confidence parameter (default 0.5 for 50% confidence)
-        bits_per_param: Bits per parameter (default 32 for float32)
+    def accuracy_for_key(model_key):
+        model = TinyMLP(model_key)
+        return compute_accuracy(model, images, labels)
 
-    Returns:
-        Dictionary with bound information
-    """
-    # Size of hypothesis class (in bits)
-    log_H_bits = n_params * bits_per_param
+    return jax.vmap(accuracy_for_key)(model_keys)
 
-    # log(1/delta) in bits
-    log_inv_delta_bits = np.log2(1 / delta)
 
-    # Generalization bound
-    sqrt_term = np.sqrt((log_H_bits + log_inv_delta_bits) / (2 * n_train_samples))
-    gen_bound = train_error + sqrt_term
+def sample_batch_of_accs(
+    key: jax.Array,
+    images: jax.Array,
+    labels: jax.Array,
+    *,
+    batch_size: int = 10_000,
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    """Sample a batch of random models and return their accuracies."""
+    next_key, batch_seed = jax.random.split(key)
+    batch_keys = jax.random.split(batch_seed, batch_size)
+    batch_accs = _batch_model_accuracies(batch_keys, images, labels)
+    return batch_accs, batch_keys, next_key
 
-    return {
-        "n_params": n_params,
-        "n_train_samples": n_train_samples,
-        "train_error": train_error,
-        "delta": delta,
-        "confidence": 1 - delta,
-        "log_H_bits": log_H_bits,
-        "log_inv_delta_bits": log_inv_delta_bits,
-        "sqrt_term": sqrt_term,
-        "generalization_bound": gen_bound,
-    }
+
+def sample_random_accuracies(
+    n_samples: int,
+    images: np.ndarray,
+    labels: np.ndarray,
+    key: jax.Array,
+    *,
+    batch_size: int = 1_000,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample random models and record their accuracies on the given split."""
+    if n_samples <= 0:
+        return np.array([]), np.empty((0, 2), dtype=np.uint32)
+    images_jax = jnp.array(images)
+    labels_jax = jnp.array(labels)
+    rng_key = key
+    accs = []
+    stored_keys = []
+    steps = n_samples // batch_size
+    for i in tqdm(range(steps)):
+        batch_accs, batch_keys, rng_key = sample_batch_of_accs(
+            rng_key, images_jax, labels_jax, batch_size=batch_size
+        )
+        accs.append(np.array(batch_accs))
+        stored_keys.append(np.array(batch_keys))
+    return np.concatenate(accs), np.concatenate(stored_keys)
+
+
+def evaluate_keys_on_data(
+    model_keys: np.ndarray, dataset, *, batch_size: int = 512
+) -> np.ndarray:
+    """Evaluate a list of random seeds on the provided dataset (batched)."""
+    if len(model_keys) == 0:
+        return np.array([])
+    images, labels = dataset
+    images_jax = jnp.array(images)
+    labels_jax = jnp.array(labels)
+    accs = []
+    for start in range(0, len(model_keys), batch_size):
+        batch_keys = jnp.array(model_keys[start : start + batch_size], dtype=jnp.uint32)
+        batch_accs = _batch_model_accuracies(batch_keys, images_jax, labels_jax)
+        accs.append(np.array(batch_accs))
+    return np.concatenate(accs)
 
 
 def train_network(
-    model, train_data, test_data, random_accs, n_epochs=10, batch_size=128, lr=1e-3
+    model: TinyMLP,
+    train_data,
+    *,
+    n_steps: int,
+    batch_size: int,
+    lr: float,
+    key: jax.Array,
 ):
-    """Train the network to find optimum."""
+    """Train the model with SGD and record metrics every step."""
     train_images, train_labels = train_data
-    test_images, test_labels = test_data
-
     train_images_jax = jnp.array(train_images)
     train_labels_jax = jnp.array(train_labels)
-    test_images_jax = jnp.array(test_images)
-    test_labels_jax = jnp.array(test_labels)
 
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    n_batches = len(train_images) // batch_size
-
-    train_accs = []
-    test_accs = []
-    train_losses = []
-    test_losses = []
-    better_than_random = []
-    better_than_random_pct = []
-
-    print(f"\nTraining network for {n_epochs} epochs...")
-    for epoch in range(n_epochs):
-        # Shuffle training data
-        indices = np.random.permutation(len(train_images))
-
-        epoch_losses = []
-        for batch_idx in range(n_batches):
-            start = batch_idx * batch_size
-            end = start + batch_size
-            batch_indices = indices[start:end]
-
-            batch_images = train_images_jax[batch_indices]
-            batch_labels = train_labels_jax[batch_indices]
-
-            model, opt_state, loss = train_step(
-                model, opt_state, optimizer, batch_images, batch_labels
-            )
-            epoch_losses.append(float(loss))
-
-        # Compute accuracies and losses
-        train_acc = compute_accuracy(model, train_images_jax, train_labels_jax)
-        test_acc = compute_accuracy(model, test_images_jax, test_labels_jax)
-        train_loss = loss_fn(model, train_images_jax, train_labels_jax)
-        test_loss = loss_fn(model, test_images_jax, test_labels_jax)
-
-        train_accs.append(float(train_acc))
-        test_accs.append(float(test_acc))
-        train_losses.append(float(train_loss))
-        test_losses.append(float(test_loss))
-
-        # Count how many random samples are better than current model
-        n_better = np.sum(random_accs >= test_accs[-1])
-        pct_better = 100.0 * n_better / len(random_accs)
-        better_than_random.append(n_better)
-        better_than_random_pct.append(pct_better)
-
-        print(
-            f"Epoch {epoch + 1}/{n_epochs} - "
-            f"Train Loss: {train_losses[-1]:.4f}, "
-            f"Test Loss: {test_losses[-1]:.4f}, "
-            f"Train Acc: {train_accs[-1]:.4f}, "
-            f"Test Acc: {test_accs[-1]:.4f}, "
-            f"Better Random: {n_better:,} ({pct_better:.2f}%)"
-        )
-
-    return model, {
-        "train_accs": train_accs,
-        "test_accs": test_accs,
-        "train_losses": train_losses,
-        "test_losses": test_losses,
-        "better_than_random": better_than_random,
-        "better_than_random_pct": better_than_random_pct,
+    history = {
+        "steps": [],
+        "train_acc": [],
+        "train_loss": [],
     }
+    n_samples = len(train_images)
+    rng = key
 
-
-def compute_random_classifier_pmf(n_samples, p=0.5):
-    """
-    Compute the probability mass function for a random binary classifier.
-
-    For a random classifier making predictions on N samples with m classes,
-    the number of correct predictions X ~ Binomial(N, p) where p = 1/m.
-    For binary classification, p = 0.5.
-
-    Returns arrays of possible accuracies and their probabilities.
-    Uses normal approximation for large N for numerical stability.
-    """
-    # Use normal approximation for large N (more numerically stable)
-    if n_samples > 100:
-        # X ~ N(μ, σ²) where μ = Np, σ² = Np(1-p)
-        mu = n_samples * p
-        sigma = np.sqrt(n_samples * p * (1 - p))
-
-        # Create array of possible number of correct predictions
-        # Focus on range within 5 standard deviations
-        k_min = max(0, int(mu - 5 * sigma))
-        k_max = min(n_samples, int(mu + 5 * sigma))
-        k_values = np.arange(k_min, k_max + 1)
-
-        # Use normal approximation with continuity correction
-        # P(X = k) ≈ P(k - 0.5 < X < k + 0.5) for continuous normal
-        pmf = stats.norm.cdf(k_values + 0.5, mu, sigma) - stats.norm.cdf(
-            k_values - 0.5, mu, sigma
+    for step in range(1, n_steps + 1):
+        rng, subkey = jax.random.split(rng)
+        indices = jax.random.randint(subkey, (batch_size,), 0, n_samples)
+        batch_images = train_images_jax[indices]
+        batch_labels = train_labels_jax[indices]
+        model, opt_state, _ = train_step(
+            model, opt_state, optimizer, batch_images, batch_labels
         )
 
-        # Convert to accuracies
-        accuracies = k_values / n_samples
+        train_acc = compute_accuracy(model, train_images_jax, train_labels_jax)
+        train_loss = loss_fn(model, train_images_jax, train_labels_jax)
+        history["steps"].append(step)
+        history["train_acc"].append(float(train_acc))
+        history["train_loss"].append(float(train_loss))
 
-    else:
-        # For small N, use exact binomial
-        k_values = np.arange(0, n_samples + 1)
-        pmf = stats.binom.pmf(k_values, n_samples, p)
-        accuracies = k_values / n_samples
-
-    return accuracies, pmf, k_values
+    return model, history
 
 
-def plot_histogram(
-    random_accs, n_test_samples, trained_acc=None, save_path="histogram.png"
-):
-    """Plot histogram of random accuracies with log scale counts."""
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-
-    counts, bins, patches = ax.hist(
+def plot_random_vs_trained(
+    random_accs: np.ndarray,
+    trained_acc: float,
+    save_path: str,
+) -> None:
+    """High-resolution histogram highlighting the trained model accuracy."""
+    plt.figure(figsize=(10, 5))
+    plt.hist(
         random_accs,
         bins=100,
-        edgecolor="black",
-        alpha=0.7,
         color="steelblue",
-        label="Observed",
+        alpha=0.85,
+        edgecolor="black",
+        linewidth=0.5,
     )
-
-    # Add theoretical distribution for truly random binary classifier
-    theoretical_accs, theoretical_pmf, theoretical_k = compute_random_classifier_pmf(
-        n_test_samples
-    )
-
-    # For each histogram bin, compute expected count by summing probabilities
-    # of all discrete k values that fall within that bin
-    theoretical_counts = np.zeros(len(bins) - 1)
-    for i in range(len(bins) - 1):
-        bin_low = bins[i]
-        bin_high = bins[i + 1]
-        # Find all k values where k/N falls in this bin
-        mask = (theoretical_accs > bin_low) & (theoretical_accs <= bin_high)
-        # Sum their probabilities and scale by number of samples
-        theoretical_counts[i] = np.sum(theoretical_pmf[mask]) * len(random_accs)
-
-    # Plot as step function matching histogram bins
-    bin_centers = (bins[:-1] + bins[1:]) / 2
-    ax.step(
-        bins[:-1],
-        theoretical_counts,
-        where="post",
-        color="black",
-        linewidth=2.5,
-        label="Random Classifier (p=0.5)",
-        zorder=5,
-    )
-
-    ax.axvline(
+    plt.axvline(
         np.mean(random_accs),
-        color="red",
+        color="black",
         linestyle="--",
-        linewidth=2,
-        label=f"Mean: {np.mean(random_accs):.4f}",
+        label=f"Random mean {np.mean(random_accs):.3f}",
     )
-    ax.axvline(
-        np.median(random_accs),
-        color="green",
+    plt.axvline(
+        trained_acc,
+        color="purple",
+        linewidth=2.5,
+        label=f"Trained {trained_acc:.3f}",
+    )
+    plt.xlabel("Accuracy on train split")
+    plt.ylabel("Count")
+    plt.yscale("log")
+    plt.title(f"Random initializations vs trained model ({len(random_accs)} samples)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=250)
+    plt.close()
+    print(f"Saved histogram to {save_path}")
+
+
+def plot_training_curves(history, save_path: str) -> None:
+    """Plot train/test accuracy and loss over optimization steps."""
+    steps = np.array(history["steps"])
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(steps, history["train_acc"], label="Train")
+    axes[0].set_xlabel("Steps")
+    axes[0].set_ylabel("Accuracy")
+    axes[0].set_title("Train accuracy vs steps")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(steps, history["train_loss"], label="Train")
+    axes[1].set_xlabel("Steps")
+    axes[1].set_ylabel("Loss")
+    axes[1].set_title("Train loss vs steps")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=600)
+    plt.close()
+    print(f"Saved training curves to {save_path}")
+
+
+def plot_random_ranked(
+    random_accs: np.ndarray, trained_acc: float, save_path: str
+) -> None:
+    """Plot sorted random accuracies to visualize top tail."""
+    sorted_accs = np.sort(random_accs)[::-1]
+    x = np.arange(1, len(sorted_accs) + 1)
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, sorted_accs, color="steelblue")
+    plt.axhline(
+        trained_acc,
+        color="purple",
         linestyle="--",
-        linewidth=2,
-        label=f"Median: {np.median(random_accs):.4f}",
+        label=f"Trained {trained_acc:.3f}",
     )
-    if trained_acc is not None:
+    plt.xlabel("Random model rank (best on left)")
+    plt.ylabel("Accuracy")
+    plt.title("Top random initializations vs trained model")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"Saved ranked plot to {save_path}")
+
+
+def plot_top_holdout_hist(top_sets, trained_acc: float, save_path: str) -> None:
+    """Plot holdout accuracy histograms for top random models."""
+    n_sets = len(top_sets)
+    fig, axes = plt.subplots(
+        n_sets, 1, figsize=(10, 4 * n_sets), sharex=True, squeeze=False
+    )
+    for idx, entry in enumerate(top_sets):
+        ax = axes[idx, 0]
+        ax.hist(
+            entry["accs"],
+            bins=60,
+            color="teal",
+            alpha=0.8,
+            edgecolor="black",
+            linewidth=0.4,
+        )
+        ax.set_yscale("log")
         ax.axvline(
             trained_acc,
             color="purple",
-            linestyle="-",
-            linewidth=3,
-            label=f"Trained: {trained_acc:.4f}",
-        )
-    ax.set_xlabel("Accuracy", fontsize=12)
-    ax.set_ylabel("Count (log scale)", fontsize=12)
-    ax.set_yscale("log")
-    ax.set_title(
-        f"Distribution of Random Initialization Accuracies (n={len(random_accs):,})",
-        fontsize=14,
-    )
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3, which="both")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Histogram saved to {save_path}")
-    plt.close()
-
-
-def plot_mistakes_histogram(
-    random_accs,
-    n_test_samples,
-    trained_acc=None,
-    save_path="histogram_mistakes_log.png",
-):
-    """Plot histogram of number of mistakes in log scale."""
-    # Convert accuracy to number of mistakes
-    n_mistakes = n_test_samples * (1.0 - random_accs)
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-
-    # Create histogram with log scale
-    counts, bins, patches = ax.hist(
-        n_mistakes,
-        bins=100,
-        edgecolor="black",
-        alpha=0.7,
-        color="coral",
-        label="Observed",
-    )
-
-    # Add theoretical distribution for truly random binary classifier
-    # Number of mistakes = N - X where X is number correct
-    theoretical_accs, theoretical_pmf, theoretical_k = compute_random_classifier_pmf(
-        n_test_samples
-    )
-    theoretical_mistakes = n_test_samples - theoretical_k
-
-    # For each histogram bin, compute expected count by summing probabilities
-    theoretical_counts = np.zeros(len(bins) - 1)
-    for i in range(len(bins) - 1):
-        bin_low = bins[i]
-        bin_high = bins[i + 1]
-        # Find all k values where n_mistakes falls in this bin
-        mask = (theoretical_mistakes > bin_low) & (theoretical_mistakes <= bin_high)
-        theoretical_counts[i] = np.sum(theoretical_pmf[mask]) * len(random_accs)
-
-    # Plot as step function
-    ax.step(
-        bins[:-1],
-        theoretical_counts,
-        where="post",
-        color="black",
-        linewidth=2.5,
-        label="Random Classifier (p=0.5)",
-        zorder=5,
-    )
-
-    ax.set_yscale("log")
-    ax.set_xlabel("Number of Mistakes", fontsize=12)
-    ax.set_ylabel("Count (log scale)", fontsize=12)
-    ax.set_title(
-        f"Distribution of Mistakes in Random Initializations (n={len(random_accs):,})",
-        fontsize=14,
-    )
-    ax.grid(True, alpha=0.3, which="both")
-
-    # Add statistics
-    mean_mistakes = np.mean(n_mistakes)
-    median_mistakes = np.median(n_mistakes)
-    ax.axvline(
-        mean_mistakes,
-        color="red",
-        linestyle="--",
-        linewidth=2,
-        label=f"Mean: {mean_mistakes:.1f}",
-    )
-    ax.axvline(
-        median_mistakes,
-        color="green",
-        linestyle="--",
-        linewidth=2,
-        label=f"Median: {median_mistakes:.1f}",
-    )
-    if trained_acc is not None:
-        trained_mistakes = n_test_samples * (1.0 - trained_acc)
-        ax.axvline(
-            trained_mistakes,
-            color="purple",
-            linestyle="-",
-            linewidth=3,
-            label=f"Trained: {trained_mistakes:.1f}",
-        )
-    ax.legend(fontsize=11)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Mistakes histogram (log scale) saved to {save_path}")
-    plt.close()
-
-
-def plot_loss_histogram(
-    random_losses, trained_loss=None, save_path="histogram_loss_log.png"
-):
-    """Plot histogram of losses in log scale."""
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-
-    ax.hist(
-        random_losses,
-        bins=100,
-        edgecolor="black",
-        alpha=0.7,
-        color="orangered",
-        label="Observed",
-    )
-
-    # Add theoretical expected loss for uniform random classifier
-    # For binary cross-entropy with uniform probabilities (p=0.5 for each class),
-    # expected loss per sample is -log(0.5) = log(2) ≈ 0.693
-    uniform_loss = np.log(2)
-    ax.axvline(
-        uniform_loss,
-        color="black",
-        linestyle="-",
-        linewidth=2.5,
-        label=f"Uniform Random (p=0.5): {uniform_loss:.4f}",
-        zorder=5,
-    )
-
-    ax.axvline(
-        np.mean(random_losses),
-        color="red",
-        linestyle="--",
-        linewidth=2,
-        label=f"Mean: {np.mean(random_losses):.4f}",
-    )
-    ax.axvline(
-        np.median(random_losses),
-        color="green",
-        linestyle="--",
-        linewidth=2,
-        label=f"Median: {np.median(random_losses):.4f}",
-    )
-    if trained_loss is not None:
-        ax.axvline(
-            trained_loss,
-            color="purple",
-            linestyle="-",
-            linewidth=3,
-            label=f"Trained: {trained_loss:.4f}",
-        )
-    ax.set_xlabel("Loss", fontsize=12)
-    ax.set_ylabel("Count (log scale)", fontsize=12)
-    ax.set_yscale("log")
-    ax.set_title(
-        f"Distribution of Random Initialization Losses (n={len(random_losses):,})",
-        fontsize=14,
-    )
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3, which="both")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Loss histogram (log scale) saved to {save_path}")
-    plt.close()
-
-
-def plot_error_rate_logscale(
-    random_accs,
-    n_test_samples=None,
-    trained_acc=None,
-    save_path="histogram_error_rate_logscale.png",
-):
-    """Plot histogram of error rates with log scale x-axis, zoomed to 0-5% error, showing both bins and individual samples."""
-    # Convert accuracy to error rate (percentage)
-    error_rates = 100.0 * (1.0 - random_accs)
-
-    # Filter to only include error rates between 0% and 5%
-    mask = (error_rates >= 0) & (error_rates <= 5.0)
-    filtered_errors = error_rates[mask]
-
-    # Sort to find the lowest error rates
-    sorted_errors = np.sort(filtered_errors)
-    min_error = sorted_errors[0] if len(sorted_errors) > 0 else None
-
-    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
-
-    # Use log-spaced bins for better visualization on log scale
-    bins = np.logspace(np.log10(max(0.01, sorted_errors[0] * 0.5)), np.log10(5.0), 80)
-
-    # Plot histogram
-    hist_counts, _, _ = ax.hist(
-        filtered_errors,
-        bins=bins,
-        edgecolor="black",
-        alpha=0.5,
-        color="teal",
-        label="Histogram",
-    )
-
-    # Add theoretical distribution for truly random binary classifier
-    if n_test_samples is None:
-        # Infer n_test_samples from the granularity of error rates
-        # Error rate = (n_mistakes / N) * 100, so granularity is (100 / N)
-        unique_errors = np.unique(error_rates[error_rates > 0])
-        if len(unique_errors) > 1:
-            # Find approximate granularity
-            diffs = np.diff(sorted(unique_errors))
-            granularity = (
-                np.min(diffs[diffs > 0.0001]) if len(diffs[diffs > 0.0001]) > 0 else 0.1
-            )
-            n_test_samples_inferred = int(np.round(100 / granularity))
-        else:
-            n_test_samples_inferred = 2500  # default estimate
-    else:
-        n_test_samples_inferred = n_test_samples
-
-    # Compute theoretical distribution
-    theoretical_accs, theoretical_pmf, theoretical_k = compute_random_classifier_pmf(
-        n_test_samples_inferred
-    )
-    theoretical_error_rates = 100.0 * (1.0 - theoretical_accs)
-
-    # For each histogram bin, compute expected count by summing probabilities
-    theoretical_bin_counts = np.zeros(len(bins) - 1)
-    for i in range(len(bins) - 1):
-        bin_low = bins[i]
-        bin_high = bins[i + 1]
-        # Find all k values where error rate falls in this bin
-        mask = (theoretical_error_rates > bin_low) & (
-            theoretical_error_rates <= bin_high
-        )
-        theoretical_bin_counts[i] = np.sum(theoretical_pmf[mask]) * len(random_accs)
-
-    # Plot as step function matching histogram bins
-    # Filter out zero counts for better visualization on log scale
-    nonzero_mask = theoretical_bin_counts > 0
-    if np.any(nonzero_mask):
-        # Create step plot
-        ax.step(
-            bins[:-1],
-            theoretical_bin_counts,
-            where="post",
-            color="black",
-            linewidth=3,
-            label=f"Random Classifier (p=0.5, N={n_test_samples_inferred})",
-            zorder=10,
-        )
-
-    # Plot individual samples as dots along the bottom
-    # Use jitter on y-axis for visibility
-    y_jitter = np.random.uniform(
-        0,
-        np.max(np.histogram(filtered_errors, bins=bins)[0]) * 0.05,
-        size=len(filtered_errors),
-    )
-    ax.scatter(
-        filtered_errors,
-        y_jitter,
-        alpha=0.3,
-        s=2,
-        color="navy",
-        label=f"Samples (n={len(filtered_errors):,})",
-    )
-
-    # Highlight the best (lowest error) samples
-    if min_error is not None:
-        best_threshold = min_error * 1.5  # Show samples within 50% of the minimum
-        best_mask = filtered_errors <= best_threshold
-        best_errors = filtered_errors[best_mask]
-        best_y_jitter = y_jitter[best_mask]
-        ax.scatter(
-            best_errors,
-            best_y_jitter,
-            alpha=0.8,
-            s=20,
-            color="red",
-            label=f"Best samples (≤{best_threshold:.3f}%, n={len(best_errors)})",
-            zorder=5,
-        )
-
-        # Add vertical line at minimum
-        ax.axvline(
-            min_error,
-            color="darkred",
             linestyle="--",
             linewidth=2,
-            label=f"Min: {min_error:.4f}%",
-            zorder=4,
+            label=f"Trained {trained_acc:.3f}",
         )
-
-    if trained_acc is not None:
-        trained_error = 100.0 * (1.0 - trained_acc)
-        if 0 <= trained_error <= 5.0:
-            ax.axvline(
-                trained_error,
-                color="purple",
-                linestyle="-",
-                linewidth=3,
-                label=f"Trained: {trained_error:.3f}%",
-                zorder=3,
-            )
-
-    ax.set_xlabel("Error Rate (%)", fontsize=12)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_xscale("log")
-    ax.set_xlim(
-        max(0.005, sorted_errors[0] * 0.5) if len(sorted_errors) > 0 else 0.01, 5.0
-    )
-    ax.set_title(
-        f"Distribution of Error Rates (0-5%, log scale)\n"
-        f"{np.sum(mask):,} of {len(random_accs):,} samples ({100 * np.sum(mask) / len(random_accs):.2f}%)",
-        fontsize=14,
-    )
-    ax.grid(True, alpha=0.3, which="both")
-    ax.legend(fontsize=10, loc="upper right")
-
+        ax.set_ylabel("Count")
+        ax.set_title(
+            f"Holdout accuracy for top {entry['label']} random models\n"
+            f"mean={np.mean(entry['accs']):.4f}, max={np.max(entry['accs']):.4f}"
+        )
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    axes[-1, 0].set_xlabel("Holdout accuracy")
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Error rate histogram (log scale x-axis) saved to {save_path}")
-    if min_error is not None:
-        print(
-            f"  Minimum error rate: {min_error:.4f}% (accuracy: {100 - min_error:.4f}%)"
-        )
+    plt.savefig(save_path, dpi=250)
     plt.close()
+    print(f"Saved top holdout histogram to {save_path}")
 
 
-def plot_top_models_holdout(
-    top100_accs,
-    top10000_accs,
-    trained_acc,
-    save_path="top_models_holdout.png",
+def fit_power_tail(
+    fractions: np.ndarray,
+    mean_error_rates: np.ndarray,
+    *,
+    tail_max_fraction: float = 0.05,
 ):
-    """Plot histogram of top models' performance on holdout set."""
-    fig, ax = plt.subplots(1, 1, figsize=(12, 7))
+    """
+    Fit log(y - baseline) = intercept + slope * log(x) on the top-fraction tail.
+    The baseline captures the limiting Bayes factor / irreducible error.
+    """
+    mask = fractions <= tail_max_fraction
+    if np.count_nonzero(mask) < 2:
+        return None
+    x = fractions[mask]
+    y = mean_error_rates[mask]
+    positive = y > 0
+    if not np.any(positive):
+        return None
+    # Search a small grid of baselines to find the line that is straightest in log-log.
+    y_min = float(np.min(y))
+    grid = np.linspace(0.0, y_min, 100)
+    best = None
+    for baseline in grid:
+        y_adj = y - baseline
+        if np.any(y_adj <= 0):
+            continue
+        lnx = np.log(x)
+        lny = np.log(y_adj)
+        slope, intercept = np.polyfit(lnx, lny, 1)
+        residuals = lny - (slope * lnx + intercept)
+        mse = float(np.mean(residuals**2))
+        if best is None or mse < best["mse"]:
+            best = {
+                "baseline": baseline,
+                "slope": slope,
+                "intercept": intercept,
+                "mse": mse,
+            }
+    if best is None:
+        return None
+    # Extrapolate slightly beyond the observed minimum percentile.
+    target_fraction = max(float(np.min(x)) * 0.1, 1e-8)
+    predicted_error = best["baseline"] + math.exp(
+        best["intercept"] + best["slope"] * math.log(target_fraction)
+    )
+    return {
+        "baseline": best["baseline"],
+        "slope": best["slope"],
+        "intercept": best["intercept"],
+        "mse": best["mse"],
+        "tail_mask": mask,
+        "target_fraction": target_fraction,
+        "predicted_error": predicted_error,
+    }
 
-    # Plot histograms with transparency
-    ax.hist(
-        top10000_accs,
-        bins=50,
-        edgecolor="black",
-        alpha=0.5,
-        color="skyblue",
-        label=f"Top 10,000 (mean: {np.mean(top10000_accs):.4f})",
-    )
-    ax.hist(
-        top100_accs,
-        bins=50,
-        edgecolor="black",
-        alpha=0.6,
-        color="coral",
-        label=f"Top 100 (mean: {np.mean(top100_accs):.4f})",
-    )
 
-    # Add vertical lines for statistics
-    ax.axvline(
-        np.mean(top10000_accs),
-        color="blue",
-        linestyle="--",
-        linewidth=2,
-        label=f"Top 10k Mean: {np.mean(top10000_accs):.4f}",
-    )
-    ax.axvline(
-        np.mean(top100_accs),
-        color="red",
-        linestyle="--",
-        linewidth=2,
-        label=f"Top 100 Mean: {np.mean(top100_accs):.4f}",
-    )
-    ax.axvline(
-        np.max(top100_accs),
+def plot_holdout_mean_error_rate(
+    top_sets,
+    save_path: str,
+    *,
+    trained_holdout_acc: float | None = None,
+    tail_fit: dict | None = None,
+    tail_max_pct: float = 0.05,
+) -> dict | None:
+    """Plot holdout mean error rate (1 - accuracy) vs top-percent threshold."""
+    fractions = np.array([entry["pct"] for entry in top_sets])
+    mean_error_rates = 1.0 - np.array([np.mean(entry["accs"]) for entry in top_sets])
+
+    # Ensure monotonic x-axis for plotting.
+    order = np.argsort(fractions)
+    fractions = fractions[order]
+    mean_error_rates = mean_error_rates[order]
+    if tail_fit is None:
+        tail_fit = fit_power_tail(
+            fractions, mean_error_rates, tail_max_fraction=tail_max_pct
+        )
+
+    x_percent = fractions * 100
+    plt.figure(figsize=(7, 4))
+    plt.loglog(
+        x_percent,
+        mean_error_rates,
+        marker="o",
         color="darkred",
-        linestyle=":",
         linewidth=2,
-        label=f"Best Random: {np.max(top100_accs):.4f}",
+        label="Holdout mean error rate",
     )
-    ax.axvline(
-        trained_acc,
-        color="purple",
-        linestyle="-",
-        linewidth=3,
-        label=f"Trained: {trained_acc:.4f}",
+    plt.xlabel("Top random models retained (%)")
+    plt.ylabel("Mean error rate (1 - accuracy)")
+    plt.title("Holdout mean error rate vs top random percentile")
+    plt.grid(True, which="both", linestyle="--", alpha=0.4)
+    plt.xticks(
+        x_percent,
+        [f"{pct:.3g}%" for pct in x_percent],
     )
-
-    ax.set_xlabel("Holdout Accuracy", fontsize=12)
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_title(
-        "Performance of Top Random Models on Holdout Set",
-        fontsize=14,
-    )
-    ax.legend(fontsize=10, loc="upper left")
-    ax.grid(True, alpha=0.3)
-
+    if trained_holdout_acc is not None:
+        trained_err = 1.0 - trained_holdout_acc
+        plt.axhline(
+            trained_err,
+            color="black",
+            linestyle=":",
+            linewidth=1.5,
+            label=f"Trained holdout error {trained_err:.4f}",
+        )
+    if tail_fit is not None:
+        x_tail = fractions[tail_fit["tail_mask"]]
+        x_fit = np.logspace(
+            math.log10(max(np.min(x_tail), 1e-8)),
+            math.log10(max(np.max(fractions), np.min(x_tail))),
+            400,
+        )
+        y_fit = tail_fit["baseline"] + np.exp(
+            tail_fit["intercept"] + tail_fit["slope"] * np.log(x_fit)
+        )
+        plt.loglog(
+            x_fit * 100,
+            y_fit,
+            linestyle="--",
+            color="navy",
+            linewidth=2,
+            label=f"Power-law tail fit (<= {tail_max_pct * 100:.1f}%)",
+        )
+        predicted_error = tail_fit["predicted_error"]
+        marker_x = tail_fit["target_fraction"]
+        plt.scatter(
+            [marker_x * 100],
+            [predicted_error],
+            color="orange",
+            marker="x",
+            s=80,
+            label=(
+                f"Extrapolated optimum err {predicted_error:.4f} "
+                f"(acc {1 - predicted_error:.4f})"
+            ),
+        )
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Top models holdout histogram saved to {save_path}")
+    plt.savefig(save_path, dpi=250)
     plt.close()
+    print(f"Saved holdout mean error-rate plot to {save_path}")
+    return tail_fit
 
 
-def plot_results(random_accs, training_history, save_path="results.png"):
-    """Plot the results."""
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+def plot_holdout_percentile_error(
+    top_sets, save_path: str, *, window: int = 100, tail_max_pct: float = 0.05
+) -> dict | None:
+    """
+    Plot the holdout error averaged over a window around each percentile threshold.
 
-    epochs = range(1, len(training_history["train_accs"]) + 1)
+    For a threshold p, we look at the models nearest to that cutoff (the last
+    `window` samples inside the top-p% set) and plot their mean holdout error.
+    Uses log-log axes like the mean-error plot for consistency.
+    """
+    fractions = []
+    percentile_errors = []
+    for entry in top_sets:
+        train_accs = np.array(entry["train_accs"])
+        holdout_accs = np.array(entry["accs"])
+        if len(train_accs) == 0 or len(train_accs) != len(holdout_accs):
+            continue
+        fractions.append(entry["pct"])
+        window_size = min(window, len(train_accs))
+        window_errors = 1.0 - holdout_accs[-window_size:]
+        percentile_errors.append(float(np.mean(window_errors)))
 
-    # Plot 1: Histogram of random accuracies
-    ax = axes[0, 0]
-    ax.hist(random_accs, bins=50, edgecolor="black", alpha=0.7)
-    ax.axvline(
-        np.mean(random_accs),
-        color="red",
-        linestyle="--",
-        label=f"Mean: {np.mean(random_accs):.4f}",
+    if len(percentile_errors) == 0:
+        print("No percentile data available to plot.")
+        return
+
+    # Ensure consistent ordering along the x-axis.
+    fractions = np.array(fractions)
+    order = np.argsort(fractions)
+    fractions = fractions[order]
+    percentile_errors = np.array(percentile_errors)[order]
+
+    tail_fit = fit_power_tail(
+        fractions, percentile_errors, tail_max_fraction=tail_max_pct
     )
-    ax.axvline(
-        np.median(random_accs),
-        color="green",
-        linestyle="--",
-        label=f"Median: {np.median(random_accs):.4f}",
+
+    x_percent = fractions * 100
+    plt.figure(figsize=(7, 4))
+    plt.loglog(
+        x_percent,
+        percentile_errors,
+        marker="s",
+        color="darkgreen",
+        linewidth=2,
+        label="Holdout error at percentile sample",
     )
-    ax.set_xlabel("Accuracy")
-    ax.set_ylabel("Count")
-    ax.set_title(f"Distribution of Random Accuracies\n(n={len(random_accs):,})")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # Plot 2: Training accuracy curves
-    ax = axes[0, 1]
-    ax.plot(epochs, training_history["train_accs"], "b-o", label="Train Accuracy")
-    ax.plot(epochs, training_history["test_accs"], "r-o", label="Test Accuracy")
-    ax.axhline(
-        np.max(random_accs),
-        color="green",
-        linestyle="--",
-        label=f"Best Random: {np.max(random_accs):.4f}",
-    )
-    ax.axhline(
-        np.mean(random_accs),
-        color="gray",
-        linestyle="--",
-        label=f"Mean Random: {np.mean(random_accs):.4f}",
-    )
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Training Progress (Accuracy)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # Plot 3: Training loss curves
-    ax = axes[0, 2]
-    ax.plot(epochs, training_history["train_losses"], "b-o", label="Train Loss")
-    ax.plot(epochs, training_history["test_losses"], "r-o", label="Test Loss")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
-    ax.set_title("Training Progress (Loss)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # Plot 4: Number of random samples better than trained model
-    ax = axes[1, 0]
-    better_counts = training_history["better_than_random"]
-    percentages = training_history["better_than_random_pct"]
-    ax.plot(epochs, better_counts, "purple", marker="o", linewidth=2)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("# Random Models Better", color="purple")
-    ax.tick_params(axis="y", labelcolor="purple")
-    ax.set_title("Volume of Better Random Initializations")
-    ax.grid(True, alpha=0.3)
-
-    # Add percentage on secondary y-axis
-    ax2 = ax.twinx()
-    ax2.plot(epochs, percentages, "orange", marker="s", linewidth=2, alpha=0.7)
-    ax2.set_ylabel("Percentage (%)", color="orange")
-    ax2.tick_params(axis="y", labelcolor="orange")
-
-    # Plot 5: Log scale better random models
-    ax = axes[1, 1]
-    ax.plot(epochs, better_counts, "purple", marker="o", linewidth=2)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("# Random Models Better (log scale)")
-    ax.set_yscale("log")
-    ax.set_title("Volume of Better Random (Log Scale)")
-    ax.grid(True, alpha=0.3, which="both")
-
-    # Plot 6: Combined accuracy and loss
-    ax = axes[1, 2]
-    ax_loss = ax.twinx()
-    l1 = ax.plot(epochs, training_history["test_accs"], "b-o", label="Test Accuracy")
-    l2 = ax_loss.plot(epochs, training_history["test_losses"], "r-s", label="Test Loss")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy", color="b")
-    ax_loss.set_ylabel("Loss", color="r")
-    ax.tick_params(axis="y", labelcolor="b")
-    ax_loss.tick_params(axis="y", labelcolor="r")
-    ax.set_title("Test Accuracy vs Loss")
-    ax.grid(True, alpha=0.3)
-    # Combine legends
-    lns = l1 + l2
-    labs = [l.get_label() for l in lns]
-    ax.legend(lns, labs, loc="best")
-
+    if tail_fit is not None:
+        x_tail = fractions[tail_fit["tail_mask"]]
+        x_fit = np.logspace(
+            math.log10(max(np.min(x_tail), 1e-8)),
+            math.log10(max(np.max(fractions), np.min(x_tail))),
+            400,
+        )
+        y_fit = tail_fit["baseline"] + np.exp(
+            tail_fit["intercept"] + tail_fit["slope"] * np.log(x_fit)
+        )
+        plt.loglog(
+            x_fit * 100,
+            y_fit,
+            linestyle="--",
+            color="navy",
+            linewidth=2,
+            label=f"Power-law tail fit (<= {tail_max_pct * 100:.1f}%)",
+        )
+    plt.xlabel("Percentile of random models retained (%)")
+    plt.ylabel("Error rate (1 - accuracy)")
+    plt.title("Holdout error vs percentile sample (log-log)")
+    plt.grid(True, which="both", linestyle="--", alpha=0.4)
+    plt.xticks(x_percent, [f"{pct:.3g}%" for pct in x_percent])
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Results plot saved to {save_path}")
+    plt.savefig(save_path, dpi=250)
     plt.close()
+    print(f"Saved percentile holdout-error plot to {save_path}")
+    return tail_fit
+
+
+# Main experiment --------------------------------------------------------------
 
 
 def main():
-    # Configuration
-    N_RANDOM_SAMPLES = 100_000
-    N_TRAIN_EPOCHS = 20
-    SEED = 42
-
-    print("=" * 60)
-    print("Measuring Volume of Low-Loss Regions")
-    print("=" * 60)
-
-    # Check if results already exist
-    results_exist = os.path.exists("results.pkl")
-    load_results = False
-
-    if results_exist:
-        print("\nFound existing results.pkl file.")
-        response = (
-            input("Do you want to load stored results instead of rerunning? (y/n): ")
-            .strip()
-            .lower()
-        )
-        load_results = response == "y"
-
-    # Set random seeds
-    np.random.seed(SEED)
-    key = jax.random.PRNGKey(SEED)
-
-    # Load data
-    print("\nLoading MNIST data (0s and 1s only)...")
-    train_data, eval_data, holdout_data = load_mnist_binary()
-
-    if load_results:
-        print("\nLoading stored results...")
-        with open("results.pkl", "rb") as f:
-            results = pickle.load(f)
-        random_accs = results["random_accuracies"]
-        random_losses = results["random_losses"]
-        training_history = results["training_history"]
-        n_eval_samples = len(eval_data[0])
-
-        # We'll still need to evaluate top models on holdout, so continue
-        print("Loaded results successfully!")
-
-        # Generate the random sampling key to get consistent model indices
-        key, subkey = jax.random.split(key)
-
-        # Need to load the trained model from somewhere or skip training parts
-        # For now, we'll just use the stored results
-        trained_model = None  # We don't have the model saved
-        trained_holdout_acc = results["holdout_comparison"]["trained_acc"]
-        trained_holdout_loss = results["holdout_comparison"]["trained_loss"]
-
-        # Check if PAC bound was saved
-        if "pac_bound" in results:
-            print("\n" + "=" * 60)
-            print("PAC Generalization Bound (from saved results):")
-            print("=" * 60)
-            pac_bound = results["pac_bound"]
-            print(f"Model parameters: {pac_bound['n_params']:,}")
-            print(f"Training samples: {pac_bound['n_train_samples']:,}")
-            print("Bits per parameter: 32 (float32)")
-            print(f"log|H| (bits): {pac_bound['log_H_bits']:,}")
-            print(
-                f"Confidence level: {pac_bound['confidence']:.0%} (δ = {pac_bound['delta']})"
-            )
-            print(f"\nTraining error: {pac_bound['train_error']:.4f}")
-            print(f"Generalization bound term: ±{pac_bound['sqrt_term']:.4f}")
-            print(f"PAC bound on test error: ≤ {pac_bound['generalization_bound']:.4f}")
-            if pac_bound["generalization_bound"] > 1.0:
-                print(f"\nNote: This bound is vacuous (> 1.0), which is typical for")
-                print(f"naive parameter-counting PAC bounds on neural networks.")
-                print(
-                    f"The bound is extremely loose and doesn't reflect actual generalization."
-                )
-            else:
-                test_error = 1.0 - training_history["test_accs"][-1]
-                print(f"\nActual test error: {test_error:.4f}")
-                print(
-                    f"Bound slack: {pac_bound['generalization_bound'] - test_error:.4f}"
-                )
-
-        # Check if top models' accuracies are already saved
-        if "top100_holdout_accs" in results["holdout_comparison"]:
-            print(
-                "\nTop models' holdout accuracies found in saved results, loading them..."
-            )
-            top100_holdout_accs_loaded = np.array(
-                results["holdout_comparison"]["top100_holdout_accs"]
-            )
-            top10000_holdout_accs_loaded = np.array(
-                results["holdout_comparison"]["top10000_holdout_accs"]
-            )
-            skip_top_eval = True
-        else:
-            print("\nTop models' holdout accuracies not found, will evaluate them...")
-            skip_top_eval = False
-
-    else:
-        # Sample random initializations (evaluated on eval set)
-        key, subkey = jax.random.split(key)
-        random_accs, random_losses, n_eval_samples = sample_random_accuracies(
-            N_RANDOM_SAMPLES, eval_data, subkey
-        )
-
-        # Print statistics
-        print("\n" + "=" * 60)
-        print("Random Initialization Statistics (on eval set):")
-        print("=" * 60)
-        print(f"Mean accuracy: {np.mean(random_accs):.4f}")
-        print(f"Median accuracy: {np.median(random_accs):.4f}")
-        print(f"Std dev: {np.std(random_accs):.4f}")
-        print(f"Min accuracy: {np.min(random_accs):.4f}")
-        print(f"Max accuracy: {np.max(random_accs):.4f}")
-        print(f"\nMean loss: {np.mean(random_losses):.4f}")
-        print(f"Median loss: {np.median(random_losses):.4f}")
-        print(f"Min loss: {np.min(random_losses):.4f}")
-        print(f"Max loss: {np.max(random_losses):.4f}")
-
-        # Count how many are above certain thresholds
-        thresholds = [0.6, 0.7, 0.8, 0.9, 0.95]
-        print("\nAccuracies above thresholds:")
-        for threshold in thresholds:
-            count = np.sum(random_accs >= threshold)
-            percentage = 100 * count / len(random_accs)
-            print(f"  >= {threshold:.2f}: {count:,} ({percentage:.2f}%)")
-
-        # Train a network (evaluated on eval set during training)
-        key, subkey_train = jax.random.split(key)
-        model = SimpleCNN(subkey_train)
-        trained_model, training_history = train_network(
-            model, train_data, eval_data, random_accs, n_epochs=N_TRAIN_EPOCHS
-        )
-
-        print("\n" + "=" * 60)
-        print("Training Results (on eval set):")
-        print("=" * 60)
-        print(f"Final train accuracy: {training_history['train_accs'][-1]:.4f}")
-        print(f"Final eval accuracy: {training_history['test_accs'][-1]:.4f}")
-        print(f"Final train loss: {training_history['train_losses'][-1]:.4f}")
-        print(f"Final eval loss: {training_history['test_losses'][-1]:.4f}")
+    parser = argparse.ArgumentParser(
+        description="Estimate low-loss volume for MNIST 0 vs 1."
+    )
+    parser.add_argument(
+        "-r",
+        "--random-labels",
+        type=float,
+        default=0.0,
+        help="Fraction (0-1) of train/holdout labels to randomize. Example: 0.1",
+    )
+    args = parser.parse_args()
+    random_label_frac = min(1.0, max(0.0, float(args.random_labels)))
+    if random_label_frac > 0:
         print(
-            f"Improvement over best random: "
-            f"{training_history['test_accs'][-1] - np.max(random_accs):.4f}"
+            f"Applying random labels to {random_label_frac * 100:.2f}% of train+holdout."
         )
 
-        # Compute PAC bound
-        n_params = count_parameters(trained_model)
-        train_error = 1.0 - training_history["train_accs"][-1]
-        pac_bound = compute_pac_bound(
-            n_params=n_params,
-            n_train_samples=len(train_data[0]),
-            train_error=train_error,
-            delta=0.5,  # 50% confidence
-            bits_per_param=32,
-        )
-
-        print("\n" + "=" * 60)
-        print("PAC Generalization Bound (50% confidence):")
-        print("=" * 60)
-        print(f"Model parameters: {pac_bound['n_params']:,}")
-        print(f"Training samples: {pac_bound['n_train_samples']:,}")
-        print(f"Bits per parameter: 32 (float32)")
-        print(f"log|H| (bits): {pac_bound['log_H_bits']:,}")
-        print(
-            f"Confidence level: {pac_bound['confidence']:.0%} (δ = {pac_bound['delta']})"
-        )
-        print(f"\nTraining error: {pac_bound['train_error']:.4f}")
-        print(f"Generalization bound term: ±{pac_bound['sqrt_term']:.4f}")
-        print(f"PAC bound on test error: ≤ {pac_bound['generalization_bound']:.4f}")
-        if pac_bound["generalization_bound"] > 1.0:
-            print(f"\nNote: This bound is vacuous (> 1.0), which is typical for")
-            print(f"naive parameter-counting PAC bounds on neural networks.")
-            print(
-                f"The bound is extremely loose and doesn't reflect actual generalization."
-            )
-        else:
-            print(f"\nActual test error: {1.0 - training_history['test_accs'][-1]:.4f}")
-            print(
-                f"Bound slack: {pac_bound['generalization_bound'] - (1.0 - training_history['test_accs'][-1]):.4f}"
-            )
-
-        # Evaluate trained model on holdout set
-        holdout_images, holdout_labels = holdout_data
-        holdout_images_jax = jnp.array(holdout_images)
-        holdout_labels_jax = jnp.array(holdout_labels)
-
-        trained_holdout_acc = compute_accuracy(
-            trained_model, holdout_images_jax, holdout_labels_jax
-        )
-        trained_holdout_loss = loss_fn(
-            trained_model, holdout_images_jax, holdout_labels_jax
-        )
-        skip_top_eval = False
-
-    # From here on, common code for both paths
-    # Find top models by eval set accuracy
-    print("\n" + "=" * 60)
-    print("Evaluating Top Random Models on Holdout Set")
-    print("=" * 60)
-
-    # Get indices of top models
-    top_k_values = [100, 10000]
-    top_indices = {k: np.argsort(random_accs)[-k:][::-1] for k in top_k_values}
-
-    print(f"\nFound top 100 and top 10,000 random models by eval accuracy")
-    print(f"Best eval accuracy: {random_accs[top_indices[100][0]]:.4f}")
-    print(f"100th best eval accuracy: {random_accs[top_indices[100][-1]]:.4f}")
-    print(f"10,000th best eval accuracy: {random_accs[top_indices[10000][-1]]:.4f}")
-
-    if skip_top_eval:
-        # Use loaded results
-        print("\nUsing loaded top models' holdout accuracies...")
-        top100_holdout_accs = top100_holdout_accs_loaded
-        top10000_holdout_accs = top10000_holdout_accs_loaded
-    else:
-        # Re-initialize top models and evaluate on holdout
-        holdout_images, holdout_labels = holdout_data
-        holdout_images_jax = jnp.array(holdout_images)
-        holdout_labels_jax = jnp.array(holdout_labels)
-
-        # Generate all model keys at once for consistency
-        all_keys = jax.random.split(subkey, N_RANDOM_SAMPLES + 1)
-
-        # Evaluate top 100 models
-        print(f"\nEvaluating top 100 models on holdout set...")
-        top100_holdout_accs = []
-        for idx in tqdm(top_indices[100]):
-            model_key = all_keys[idx + 1]
-            model = SimpleCNN(model_key)
-            acc = compute_accuracy(model, holdout_images_jax, holdout_labels_jax)
-            top100_holdout_accs.append(float(acc))
-        top100_holdout_accs = np.array(top100_holdout_accs)
-
-        # Evaluate top 10,000 models
-        print(f"\nEvaluating top 10,000 models on holdout set...")
-        top10000_holdout_accs = []
-        for idx in tqdm(top_indices[10000]):
-            model_key = all_keys[idx + 1]
-            model = SimpleCNN(model_key)
-            acc = compute_accuracy(model, holdout_images_jax, holdout_labels_jax)
-            top10000_holdout_accs.append(float(acc))
-        top10000_holdout_accs = np.array(top10000_holdout_accs)
-
-    # Print statistics
-    print("\n" + "=" * 60)
-    print("HOLDOUT SET COMPARISON:")
-    print("=" * 60)
-    print(f"\nTop 100 Random Models:")
-    print(f"  Mean Accuracy: {np.mean(top100_holdout_accs):.4f}")
-    print(f"  Std Accuracy: {np.std(top100_holdout_accs):.4f}")
-    print(f"  Best Accuracy: {np.max(top100_holdout_accs):.4f}")
-    print(f"  Worst Accuracy: {np.min(top100_holdout_accs):.4f}")
-    print(f"\nTop 10,000 Random Models:")
-    print(f"  Mean Accuracy: {np.mean(top10000_holdout_accs):.4f}")
-    print(f"  Std Accuracy: {np.std(top10000_holdout_accs):.4f}")
-    print(f"  Best Accuracy: {np.max(top10000_holdout_accs):.4f}")
-    print(f"  Worst Accuracy: {np.min(top10000_holdout_accs):.4f}")
-    print(f"\nTrained Model:")
-    print(f"  Accuracy: {float(trained_holdout_acc):.4f}")
-    print(f"  Loss: {float(trained_holdout_loss):.4f}")
-    print(f"\nDifference (Trained - Best Random):")
+    print(f"Comparing digits {DIGIT_A} vs {DIGIT_B}")
+    train_data, holdout_data = load_mnist_pair(
+        DIGIT_A,
+        DIGIT_B,
+        TRAIN_PER_CLASS,
+        HOLDOUT_PER_CLASS,
+        seed=SEED,
+        random_label_frac=random_label_frac,
+    )
     print(
-        f"  Accuracy: {float(trained_holdout_acc) - np.max(top100_holdout_accs):+.4f}"
+        f"Train split: {len(train_data[0])} samples | "
+        f"Holdout split: {len(holdout_data[0])} samples"
     )
 
-    # Plot histograms with trained model markers
-    final_test_acc = training_history["test_accs"][-1]
-    final_test_loss = training_history["test_losses"][-1]
-
-    print("\n" + "=" * 60)
-    print("Generating plots...")
-    print("=" * 60)
-
-    plot_histogram(
-        random_accs, n_eval_samples, final_test_acc, save_path="histogram.png"
+    key = jax.random.PRNGKey(SEED)
+    key, random_key = jax.random.split(key)
+    random_accs, random_keys = sample_random_accuracies(
+        N_RANDOM_SAMPLES, train_data[0], train_data[1], random_key
     )
-    plot_mistakes_histogram(
-        random_accs,
-        n_eval_samples,
-        final_test_acc,
-        save_path="histogram_mistakes_log.png",
-    )
-    plot_loss_histogram(
-        random_losses, final_test_loss, save_path="histogram_loss_log.png"
-    )
-    plot_error_rate_logscale(
-        random_accs,
-        n_eval_samples,
-        final_test_acc,
-        save_path="histogram_error_rate_logscale.png",
+    print(
+        f"Random models (train split): "
+        f"mean={np.mean(random_accs):.3f} best={np.max(random_accs):.3f}"
     )
 
-    # Plot top models' holdout performance
-    plot_top_models_holdout(
-        top100_holdout_accs,
-        top10000_holdout_accs,
-        float(trained_holdout_acc),
-        save_path="top_models_holdout.png",
+    key, init_key = jax.random.split(key)
+    model = TinyMLP(init_key)
+    key, train_key = jax.random.split(key)
+    trained_model, history = train_network(
+        model,
+        train_data,
+        n_steps=N_SGD_STEPS,
+        batch_size=BATCH_SIZE,
+        lr=LEARNING_RATE,
+        key=train_key,
     )
 
-    # Save results
-    if not load_results or not skip_top_eval:
-        # Save if we just ran the experiment or if we evaluated top models
-        results = {
-            "random_accuracies": random_accs,
-            "random_losses": random_losses,
-            "training_history": training_history,
-            "holdout_comparison": {
-                "trained_acc": float(trained_holdout_acc),
-                "trained_loss": float(trained_holdout_loss),
-                "top100_holdout_accs": top100_holdout_accs.tolist(),
-                "top10000_holdout_accs": top10000_holdout_accs.tolist(),
-            },
-            "config": {
-                "n_random_samples": N_RANDOM_SAMPLES,
-                "n_train_epochs": N_TRAIN_EPOCHS,
-                "seed": SEED,
-            },
-        }
+    final_train_acc = history["train_acc"][-1]
+    better_than_trained = np.mean(random_accs >= final_train_acc) * 100
+    param_count = count_parameters(trained_model)
+    holdout_images, holdout_labels = holdout_data
+    holdout_images_jax = jnp.array(holdout_images)
+    holdout_labels_jax = jnp.array(holdout_labels)
+    trained_holdout_acc = float(
+        compute_accuracy(trained_model, holdout_images_jax, holdout_labels_jax)
+    )
 
-        # Add PAC bound if we just trained
-        if not load_results:
-            results["pac_bound"] = {
-                k: float(v) if isinstance(v, (np.floating, np.integer)) else v
-                for k, v in pac_bound.items()
+    print("\nSummary")
+    print("-" * 60)
+    print(f"Parameters: {param_count}")
+    print(f"Random label noise: {random_label_frac * 100:.2f}%")
+    print(f"Final train accuracy:  {final_train_acc:.4f}")
+    print(f"Final holdout accuracy:{trained_holdout_acc:.4f}")
+    print(
+        f"Random models better than trained (train split): {better_than_trained:.2f}%"
+    )
+    plot_random_vs_trained(random_accs, final_train_acc, HISTOGRAM_PATH)
+    plot_training_curves(history, TRAINING_PLOT_PATH)
+    plot_random_ranked(random_accs, final_train_acc, RANDOM_RANKED_PATH)
+
+    cache, cache_locked = load_results_cache()
+    eval_meta = {
+        "digit_a": DIGIT_A,
+        "digit_b": DIGIT_B,
+        "train_per_class": TRAIN_PER_CLASS,
+        "holdout_per_class": HOLDOUT_PER_CLASS,
+        "seed": SEED,
+        "n_random_samples": len(random_accs),
+        "random_label_frac": random_label_frac,
+    }
+    cached_top_sets = cache.get("top_eval_cache", {})
+    cache_updated = False
+    if cache.get("top_eval_meta") != eval_meta:
+        cached_top_sets = {}
+
+    # 20 log-spaced percent thresholds from 0.001% to 10%.
+    percent_specs = [
+        (f"{pct * 100:.4g}%", float(pct))
+        for pct in np.logspace(np.log10(0.00001), np.log10(0.10), num=20)
+    ]
+    sorted_indices = np.argsort(random_accs)[::-1]
+    top_sets = []
+    for label, fraction in percent_specs:
+        count = max(1, int(math.ceil(fraction * len(random_accs))))
+        indices = sorted_indices[:count]
+        subset_keys = random_keys[indices]
+        cached_entry = cached_top_sets.get(fraction)
+        if (
+            cached_entry
+            and len(cached_entry.get("accs", [])) == count
+            and len(cached_entry.get("train_accs", [])) == count
+        ):
+            holdout_accs = np.array(cached_entry["accs"])
+            train_accs = np.array(cached_entry["train_accs"])
+            print(f"Using cached evaluation for top {label}")
+        else:
+            holdout_accs = evaluate_keys_on_data(
+                subset_keys, holdout_data, batch_size=256
+            )
+            train_accs = evaluate_keys_on_data(subset_keys, train_data, batch_size=256)
+            cached_top_sets[fraction] = {
+                "label": label,
+                "pct": fraction,
+                "accs": holdout_accs,
+                "train_accs": train_accs,
+                "count": count,
             }
+            cache_updated = True
+        top_sets.append(
+            {
+                "label": label,
+                "pct": fraction,
+                "accs": holdout_accs,
+                "train_accs": train_accs,
+            }
+        )
+        print(
+            f"Top {label}: "
+            f"train mean={np.mean(train_accs):.4f}, best={np.max(train_accs):.4f} | "
+            f"holdout mean={np.mean(holdout_accs):.4f}, best={np.max(holdout_accs):.4f} "
+            f"(count={len(holdout_accs)})"
+        )
 
-        with open("results.pkl", "wb") as f:
-            pickle.dump(results, f)
-        print("\nResults saved to results.pkl")
+    if cache_updated:
+        cache["top_eval_meta"] = eval_meta
+        cache["top_eval_cache"] = cached_top_sets
+        if cache_locked:
+            print(
+                "Skipped cache write because existing cache could not be read safely."
+            )
+        else:
+            save_results_cache(cache, allow_overwrite=True)
 
-    # Plot training results
-    plot_results(random_accs, training_history)
+    fractions = np.array([entry["pct"] for entry in top_sets])
+    mean_error_rates = 1.0 - np.array([np.mean(entry["accs"]) for entry in top_sets])
+    tail_fit = fit_power_tail(fractions, mean_error_rates, tail_max_fraction=0.05)
+    best_sampled_holdout = max(np.max(entry["accs"]) for entry in top_sets)
+    if tail_fit is not None:
+        error_factor_per_halving = 2 ** tail_fit["slope"]
+        print("Power-law tail fit with limiting error (<=5% top samples):")
+        limiting_holdout_acc = 1.0 - tail_fit["baseline"]
+        print(f"  Limiting error ~{tail_fit['baseline']:.5f}")
+        print(f"  Limiting holdout acc ~{limiting_holdout_acc:.5f}")
+        print(
+            f"  Limiting vs best sampled holdout acc: "
+            f"{limiting_holdout_acc:.5f} vs {best_sampled_holdout:.5f}"
+        )
+        print(
+            "  Residual error scales by "
+            f"{error_factor_per_halving:.4f} per 2x tighter percentile "
+            f"(slope={tail_fit['slope']:.4f})"
+        )
+        print(
+            f"Trained holdout acc: {trained_holdout_acc:.4f} | "
+            f"Best sampled holdout acc: {best_sampled_holdout:.4f}"
+        )
+    else:
+        print("Not enough tail points to fit power-law extrapolation.")
 
-    print("\n" + "=" * 60)
-    print("Experiment complete!")
-    print("=" * 60)
+    plot_holdout_mean_error_rate(
+        top_sets,
+        HOLDOUT_MEAN_ERROR_PLOT_PATH,
+        trained_holdout_acc=trained_holdout_acc,
+        tail_fit=tail_fit,
+        tail_max_pct=0.05,
+    )
+    percentile_tail_fit = plot_holdout_percentile_error(
+        top_sets, PERCENTILE_HOLDOUT_ERROR_PLOT_PATH
+    )
+    if percentile_tail_fit is not None:
+        limiting_err = percentile_tail_fit["baseline"]
+        limiting_acc = 1.0 - limiting_err
+        best_percentile_acc = 1.0 - percentile_tail_fit["predicted_error"]
+        print("Percentile power-law tail fit (window avg):")
+        print(
+            f"  Limiting error ~{limiting_err:.5f} | limiting acc ~{limiting_acc:.5f}"
+        )
+        print(
+            f"  Extrapolated optimum err {percentile_tail_fit['predicted_error']:.5f} "
+            f"| acc {best_percentile_acc:.5f} at ~{percentile_tail_fit['target_fraction'] * 100:.4f}%"
+        )
+    else:
+        print("No percentile-tail fit available.")
+    plot_top_holdout_hist(top_sets, trained_holdout_acc, TOP_HOLDOUT_PLOT_PATH)
 
 
 if __name__ == "__main__":
